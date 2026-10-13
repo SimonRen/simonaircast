@@ -92,7 +92,63 @@ enum Command {
         /// HomePod over home Wi-Fi.
         #[arg(long, default_value_t = 100)]
         delay_ms: u64,
+        #[command(flatten)]
+        advanced: Advanced,
     },
+    /// Measure the real delay with a microphone: plays clicks on this PC
+    /// (streamed to the speaker as usual) and times when the mic hears them.
+    /// Takes over the receiver for each run.
+    LatencyTest {
+        /// Receiver name (as shown by `list`) or IP address.
+        #[arg(long, required_unless_present = "analyze")]
+        to: Option<String>,
+        /// Analyze a recording made on a phone (WAV) instead of using the PC
+        /// mic: the gap between PC-speaker and AirPlay clicks.
+        #[arg(long, conflicts_with_all = ["to", "sweep"])]
+        analyze: Option<PathBuf>,
+        /// No PC mic: just play the clicks so a phone can record them.
+        #[arg(long, conflicts_with = "analyze")]
+        no_mic: bool,
+        #[arg(long, default_value_t = 12)]
+        clicks: usize,
+        /// Time between clicks; must exceed the delay being measured.
+        #[arg(long, default_value_t = 1500)]
+        period_ms: u64,
+        #[arg(long, default_value_t = 25)]
+        buffer_ms: u64,
+        /// Playout delay (see `live`).
+        #[arg(long, default_value_t = 100)]
+        delay_ms: u64,
+        #[command(flatten)]
+        advanced: Advanced,
+        /// Measure every combination of latencyMin 250/100/50 ms and delay
+        /// 100/50/0 ms, one session each.
+        #[arg(long)]
+        sweep: bool,
+    },
+}
+
+/// Experimental stream parameters.
+#[derive(clap::Args, Clone, Copy)]
+struct Advanced {
+    /// `latencyMin` asked of the receiver in SETUP, in ms. Receivers may add
+    /// buffering of their own up to this; lower can cut real delay.
+    #[arg(long, default_value_t = 250)]
+    latency_min_ms: u64,
+    /// Send uncompressed ALAC frames instead of raw PCM (for receivers that
+    /// refuse PCM).
+    #[arg(long)]
+    alac: bool,
+}
+
+impl Advanced {
+    fn codec(self) -> airplay::stream::Codec {
+        if self.alac {
+            airplay::stream::Codec::AlacUncompressed
+        } else {
+            airplay::stream::Codec::Pcm
+        }
+    }
 }
 
 fn main() -> Result<()> {
@@ -127,6 +183,7 @@ async fn run(cli: Cli) -> Result<()> {
             no_volume_sync,
             buffer_ms,
             delay_ms,
+            advanced,
         } => {
             live(
                 &to,
@@ -134,9 +191,56 @@ async fn run(cli: Cli) -> Result<()> {
                     delay: Duration::from_millis(delay_ms),
                     buffer: Duration::from_millis(buffer_ms),
                     volume_sync: !no_volume_sync,
+                    codec: advanced.codec(),
+                    latency_min: Duration::from_millis(advanced.latency_min_ms),
                 },
             )
             .await
+        }
+        Command::LatencyTest {
+            to,
+            analyze,
+            no_mic,
+            clicks,
+            period_ms,
+            buffer_ms,
+            delay_ms,
+            advanced,
+            sweep,
+        } => {
+            let period = Duration::from_millis(period_ms);
+            if let Some(path) = analyze {
+                return analyze_recording(&path, period);
+            }
+            let base = engine::Settings {
+                delay: Duration::from_millis(delay_ms),
+                buffer: Duration::from_millis(buffer_ms),
+                volume_sync: true,
+                codec: advanced.codec(),
+                latency_min: Duration::from_millis(advanced.latency_min_ms),
+            };
+            let runs: Vec<engine::Settings> = if sweep {
+                [250, 100, 50]
+                    .into_iter()
+                    .flat_map(|min| {
+                        let base = &base;
+                        [100, 50, 0].into_iter().map(move |delay| engine::Settings {
+                            delay: Duration::from_millis(delay),
+                            latency_min: Duration::from_millis(min),
+                            ..base.clone()
+                        })
+                    })
+                    .collect()
+            } else {
+                vec![base]
+            };
+            let probe = audio_capture::probe::ProbeConfig {
+                clicks,
+                period,
+                record: !no_mic,
+                ..Default::default()
+            };
+            latency_test(&to.context("--to is required")?, &runs, &probe).await
         }
         Command::Play {
             to,
@@ -357,12 +461,14 @@ async fn live(target: &str, settings: engine::Settings) -> Result<()> {
                 if secs >= last_report + 10 {
                     last_report = secs;
                     println!(
-                        "  {secs:>5}s  buffer {:>3} ms  drift corr {:+6.1} ppm  underruns {}  lag {} ms  retransmits {}",
+                        "  {secs:>5}s  buffer {:>3} ms  drift corr {:+6.1} ppm  underruns {}  lag {} ms  skipped {}  retransmits {} (expired {})",
                         s.capture.buffered.as_millis(),
                         s.capture.correction_ppm,
                         s.capture.underruns,
                         s.play.max_lag.as_millis(),
-                        s.play.retransmit_requests
+                        s.play.skipped_packets,
+                        s.play.retransmit_requests,
+                        s.play.expired_retransmits
                     );
                 }
             }
@@ -379,6 +485,194 @@ async fn live(target: &str, settings: engine::Settings) -> Result<()> {
             }
         }
     }
+}
+
+const PHONE_STEPS: &str = "\
+Without a PC microphone, record on a phone instead:
+  1. Make sure the PC's own speakers (or monitor speakers) are audible, at a
+     moderate volume, and put the phone halfway between them and the speaker.
+  2. Start a voice recording, then run:  simonaircast latency-test --to <speaker> --no-mic
+  3. Copy the recording to the PC as WAV (convert m4a with any converter) and run:
+       simonaircast latency-test --analyze recording.wav";
+
+/// One session per settings combination: stream as usual, play clicks,
+/// time them on the mic.
+async fn latency_test(
+    target: &str,
+    runs: &[engine::Settings],
+    probe: &audio_capture::probe::ProbeConfig,
+) -> Result<()> {
+    use engine::{Command, Engine, State};
+    use simonaircast::latency;
+
+    let _timer = HighResTimer::enter();
+    let period = probe.period.as_secs_f64();
+    let mut results = Vec::new();
+    for settings in runs {
+        let label = format!(
+            "latencyMin {:>3} ms, delay {:>3} ms{}",
+            settings.latency_min.as_millis(),
+            settings.delay.as_millis(),
+            if settings.codec == airplay::stream::Codec::Pcm {
+                ""
+            } else {
+                ", ALAC"
+            }
+        );
+        println!("== {label}");
+        let engine = Engine::spawn(settings.clone());
+        engine.send(Command::Start(target.to_string()));
+        let mut state = engine.state.clone();
+        let up = tokio::time::timeout(
+            Duration::from_secs(20),
+            state.wait_for(|s| matches!(s, State::Streaming { .. } | State::Idle { .. })),
+        )
+        .await
+        .map(|r| r.map(|s| s.clone()));
+        match up {
+            Ok(Ok(State::Streaming { .. })) => {}
+            Ok(Ok(State::Idle { note })) => bail!("not streaming: {}", note.unwrap_or_default()),
+            _ => {
+                engine.send(Command::Stop);
+                bail!("could not start streaming to {target} within 20 s");
+            }
+        }
+        // Let the drift controller and the receiver's buffer settle.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        let config = probe.clone();
+        let recorded =
+            tokio::task::spawn_blocking(move || audio_capture::probe::record_clicks(&config))
+                .await?;
+        let stats = engine.stats.borrow().clone();
+        engine.send(Command::Stop);
+        let _ = tokio::time::timeout(
+            Duration::from_secs(3),
+            state.wait_for(|s| matches!(s, State::Idle { .. })),
+        )
+        .await;
+
+        let rec = match recorded {
+            Ok(rec) => rec,
+            Err(e) => {
+                if probe.record {
+                    eprintln!("{PHONE_STEPS}");
+                }
+                bail!("probe failed: {e}");
+            }
+        };
+        if rec.mic_name.is_none() {
+            println!(
+                "   played {} clicks on {}",
+                rec.clicks.len(),
+                rec.output_name
+            );
+            continue;
+        }
+        let wav = save_recording(&rec, results.len())?;
+        let m = latency::measure(
+            &latency::onsets(&rec.samples, rec.rate),
+            &rec.clicks,
+            period,
+        );
+        println!(
+            "   mic \"{}\", output \"{}\", saved {}",
+            rec.mic_name.as_deref().unwrap_or("?"),
+            rec.output_name,
+            wav.display()
+        );
+        println!(
+            "   stream: skipped {}, underruns {}, retransmits {} (expired {})",
+            stats.play.skipped_packets,
+            stats.capture.underruns,
+            stats.play.retransmit_requests,
+            stats.play.expired_retransmits
+        );
+        let show = |s: Option<latency::Summary>| s.map_or("not heard".into(), |s| s.to_string());
+        println!("   PC speakers       {}", show(m.pc));
+        println!("   AirPlay speaker   {}", show(m.airplay));
+        println!("   speaker behind PC {}", show(m.gap));
+        if m.airplay.is_none() {
+            println!("   (no AirPlay clicks heard: is the mic near the speaker, volume up?)");
+        }
+        results.push((label, m));
+    }
+
+    if results.len() > 1 {
+        println!("\nsummary (median click -> AirPlay speaker, and behind the PC speakers):");
+        for (label, m) in &results {
+            let ms = |s: Option<latency::Summary>| {
+                s.map_or("   -".into(), |s| format!("{:>4.0}", s.median_ms))
+            };
+            println!(
+                "  {label}   speaker {} ms   behind PC {} ms",
+                ms(m.airplay),
+                ms(m.gap)
+            );
+        }
+    }
+    if !probe.record {
+        println!(
+            "\nnow stop the phone recording and run: simonaircast latency-test --analyze <file.wav>"
+        );
+    }
+    Ok(())
+}
+
+fn save_recording(rec: &audio_capture::probe::ProbeRecording, run: usize) -> Result<PathBuf> {
+    let dir = simonaircast::logging::log_dir();
+    std::fs::create_dir_all(&dir)?;
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let path = dir.join(format!("latency-{stamp}-{run}.wav"));
+    let spec = hound::WavSpec {
+        channels: 1,
+        sample_rate: rec.rate,
+        bits_per_sample: 32,
+        sample_format: hound::SampleFormat::Float,
+    };
+    let mut w = hound::WavWriter::create(&path, spec)?;
+    for &s in &rec.samples {
+        w.write_sample(s)?;
+    }
+    w.finalize()?;
+    Ok(path)
+}
+
+fn analyze_recording(path: &std::path::Path, period: Duration) -> Result<()> {
+    use simonaircast::latency;
+
+    let mut reader =
+        hound::WavReader::open(path).with_context(|| format!("opening {}", path.display()))?;
+    let spec = reader.spec();
+    let channels = usize::from(spec.channels.max(1));
+    let all: Vec<f32> = match spec.sample_format {
+        hound::SampleFormat::Float => reader.samples::<f32>().collect::<Result<_, _>>()?,
+        hound::SampleFormat::Int => {
+            let scale = (1u64 << (spec.bits_per_sample - 1)) as f32;
+            reader
+                .samples::<i32>()
+                .map(|s| s.map(|v| v as f32 / scale))
+                .collect::<Result<_, _>>()?
+        }
+    };
+    let mono: Vec<f32> = all.iter().step_by(channels).copied().collect();
+    let found = latency::onsets(&mono, spec.sample_rate);
+    println!(
+        "{}: {:.1} s, {} clicks heard",
+        path.display(),
+        mono.len() as f64 / f64::from(spec.sample_rate),
+        found.len()
+    );
+    match latency::measure_pairs(&found, period.as_secs_f64()) {
+        Some(gap) => println!("AirPlay speaker behind the PC speakers: {gap}"),
+        None => println!(
+            "no click pairs found: both the PC speakers and the AirPlay speaker must be audible"
+        ),
+    }
+    Ok(())
 }
 
 async fn session(target: &str, hold: Duration) -> Result<()> {

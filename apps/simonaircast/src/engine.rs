@@ -9,7 +9,8 @@
 
 use std::time::{Duration, Instant};
 
-use airplay::session::{PlayStats, Session};
+use airplay::session::{PlayStats, Session, SessionOptions};
+use airplay::stream::Codec;
 use anyhow::{Context, Result, anyhow, bail};
 use audio_capture::volume::{OutputVolume, VolumeWatcher, airplay_volume_db, compensation_gain};
 use audio_capture::{Capture, CaptureConfig, CaptureStats};
@@ -30,6 +31,11 @@ pub struct Settings {
     pub buffer: Duration,
     /// Receiver volume follows the Windows volume.
     pub volume_sync: bool,
+    /// Payload encoding; PCM unless a receiver needs ALAC framing.
+    pub codec: Codec,
+    /// `latencyMin` announced in the stream SETUP. Whether HomePods add this to
+    /// `delay` is unresolved (docs/research) — the latency test measures it.
+    pub latency_min: Duration,
 }
 
 impl Default for Settings {
@@ -38,7 +44,20 @@ impl Default for Settings {
             delay: Duration::from_millis(100),
             buffer: Duration::from_millis(25),
             volume_sync: true,
+            codec: Codec::Pcm,
+            latency_min: Duration::from_millis(250),
         }
+    }
+}
+
+/// Protocol options for a session with these settings.
+pub fn session_options(settings: &Settings) -> SessionOptions {
+    let frames = |d: Duration| airplay::stream::latency_frames(d);
+    SessionOptions {
+        ports: crate::system::local_ports(),
+        codec: settings.codec,
+        latency_min: frames(settings.latency_min),
+        latency_max: frames(settings.latency_min.max(Duration::from_secs(2))),
     }
 }
 
@@ -244,7 +263,7 @@ async fn stream(
 
     let connect = async {
         let addr = crate::net::resolve(name).await?;
-        Session::connect_with_ports(addr, SENDER_NAME, crate::system::local_ports())
+        Session::connect_with(addr, SENDER_NAME, session_options(settings))
             .await
             .with_context(|| format!("connecting to {name}"))
     };

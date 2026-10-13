@@ -72,7 +72,28 @@ Status 2026-10-13 (remote, no audio tests): M6a–M6c implemented, unit-tested, 
 smoke-tested in a scratch profile (starts, discovers 3 receivers, single instance),
 installed to `%LOCALAPPDATA%\Programs\simonaircast` without launching.
 
+## M7 — Stability + real latency (built 2026-10-13; at-home measurement pending)
+From `docs/research/2026-10-13-*.md` (ideas only — the projects studied are GPL).
+
+- Monotonic NTP clock (wall-clock jumps no longer move the timeline).
+- Event-channel replies are a bare `200 OK` + CSeq (what receivers expect).
+- Liveness from two signals: a `/feedback` stall (2 s timeout) only ends the session
+  when the receiver also stopped sending timing requests, or after 6 failures.
+- Skip, don't burst: if sending falls >60 ms behind (e.g. a CPU stall), the missed
+  slots are skipped and the sync re-sent, instead of a burst of late packets.
+- Deadline-aware retransmits: packets older than the playout window aren't resent;
+  new audio is sent before retransmits.
+- Uncompressed-ALAC codec (`--alac`) for receivers that refuse PCM.
+- `latencyMin` configurable (`--latency-min-ms`, settings `latency_min_ms`).
+- `latency-test`: plays clicks on the PC and times them on the microphone (or a phone
+  recording), with `--sweep` over latencyMin × delay. See testing-at-home §6.
+
+Next candidates: Wi-Fi background-scan off while streaming (`WlanSetInterface`),
+QoS/DSCP marking (installer policy), HomePod play/pause → Windows media keys.
+
 ## Open questions
+- What sets the HomePod's real delay: our sync shift, `latencyMin`, or both added?
+  Answer with `latency-test --sweep`; then pick the defaults.
 - Why a program-based firewall allow rule for python.exe did not apply (IP-based rule worked). Matters for how we install our own rule.
 - NTP works for realtime audio on OS 27; PTP only needed if we move to buffered audio (type 103).
 - Apple TV 客厅 rejects plain OPTIONS with 403 and transient `/pair-setup` with 470

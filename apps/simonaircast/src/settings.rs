@@ -16,6 +16,10 @@ pub struct AppSettings {
     pub delay_ms: u64,
     pub buffer_ms: u64,
     pub volume_sync: bool,
+    /// Advanced (no menu item): `latencyMin` sent in SETUP, see engine::Settings.
+    pub latency_min_ms: u64,
+    /// Advanced (no menu item): send uncompressed ALAC frames instead of PCM.
+    pub alac: bool,
 }
 
 impl Default for AppSettings {
@@ -26,6 +30,8 @@ impl Default for AppSettings {
             delay_ms: engine.delay.as_millis() as u64,
             buffer_ms: engine.buffer.as_millis() as u64,
             volume_sync: engine.volume_sync,
+            latency_min_ms: engine.latency_min.as_millis() as u64,
+            alac: engine.codec == airplay::stream::Codec::AlacUncompressed,
         }
     }
 }
@@ -70,6 +76,12 @@ impl AppSettings {
             delay: Duration::from_millis(self.delay_ms),
             buffer: Duration::from_millis(self.buffer_ms),
             volume_sync: self.volume_sync,
+            codec: if self.alac {
+                airplay::stream::Codec::AlacUncompressed
+            } else {
+                airplay::stream::Codec::Pcm
+            },
+            latency_min: Duration::from_millis(self.latency_min_ms),
         }
     }
 }

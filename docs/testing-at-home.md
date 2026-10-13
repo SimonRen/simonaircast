@@ -51,6 +51,30 @@ taking effect. Temporary workaround while we look at it (admin PowerShell):
 New-NetFirewallRule -DisplayName 'simonaircast temp - HomePod UDP in' -Direction Inbound -Protocol UDP -RemoteAddress 192.168.166.12 -Action Allow
 ```
 
+## 6. Measure the real delay (M7)
+Quit the tray app first (it would fight for the speaker). Needs a microphone on the PC
+(webcam, headset or laptop mic) set as the default recording device, and audible PC
+speakers (the Dell monitor) so the gap to the HomePod can be measured.
+
+```powershell
+$exe = "C:\work\simonaircast\target\release\simonaircast.exe"   # until the next installer
+& $exe latency-test --to 书房              # current defaults, 12 clicks
+& $exe latency-test --to 书房 --sweep      # 9 runs: latencyMin 250/100/50 × delay 100/50/0
+```
+
+- [ ] Each run prints "PC speakers", "AirPlay speaker" and **"speaker behind PC"** —
+      the last one is what you notice watching a video. Mic recordings are saved in the
+      log folder (`latency-*.wav`).
+- [ ] Note which combinations stay clean (no clicks missing, `skipped 0`) and which is
+      lowest. Listen to music for a minute at the best one: `live --to 书房
+      --latency-min-ms <x> --delay-ms <y>`.
+- [ ] Delay 0 probably drops audio — that's expected; it tells us whether the HomePod
+      buffers `latencyMin` on its own.
+
+No PC mic? Record with a phone halfway between monitor and HomePod, run
+`latency-test --to 书房 --no-mic`, then copy the recording as WAV and run
+`latency-test --analyze recording.wav`.
+
 ## Known limits
 - HDMI audio (the Dell monitor) disappears when the monitor sleeps or is off; streaming
   pauses and resumes when it's back. Making the Realtek output the default avoids that.

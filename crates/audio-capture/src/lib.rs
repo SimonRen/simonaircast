@@ -10,6 +10,8 @@
 //!   drain (dropouts) or grow (creeping latency).
 
 pub mod priority;
+#[cfg(windows)]
+pub mod probe;
 pub mod volume;
 #[cfg(windows)]
 mod wasapi_loopback;

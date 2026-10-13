@@ -42,6 +42,8 @@ pub struct Request {
     pub protocol: Protocol,
     pub headers: Vec<(String, String)>,
     pub body: Vec<u8>,
+    /// How long to wait for the response (default 10 s).
+    pub timeout: Duration,
 }
 
 impl Request {
@@ -52,7 +54,13 @@ impl Request {
             protocol,
             headers: Vec::new(),
             body: Vec::new(),
+            timeout: RESPONSE_TIMEOUT,
         }
+    }
+
+    pub fn timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
     }
 
     pub fn header(mut self, name: &str, value: impl ToString) -> Self {
@@ -167,7 +175,7 @@ impl Connection {
         };
         self.stream.write_all(&out).await?;
 
-        let resp = timeout(RESPONSE_TIMEOUT, self.read_response())
+        let resp = timeout(req.timeout, self.read_response())
             .await
             .map_err(|_| Error::Timeout("response"))??;
         tracing::debug!(request = %req.describe(), status = resp.status, len = resp.body.len(), "recv");

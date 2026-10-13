@@ -3,8 +3,8 @@
 //! The receiver uses it to push RTSP requests to us (e.g. `POST /command` with
 //! `updateInfo`). We are the server on this channel, so its HAP keys are the
 //! control-channel naming swapped: we write with `Events-Read-Encryption-Key`
-//! and read with `Events-Write-Encryption-Key`. Every request gets a bare 200,
-//! as pyatv does.
+//! and read with `Events-Write-Encryption-Key`. Every request gets a bare 200
+//! carrying only `Server` and `CSeq`.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -110,8 +110,12 @@ impl Drop for EventChannel {
     }
 }
 
+/// A bare 200. pyatv also adds `Content-Length: 0` and `Audio-Latency: 0`;
+/// two independent senders (airplay2-sender-cpp, DeetsAirplay) found those
+/// headers caused "connected but silent" or a corrupted realtime timeline on
+/// some receivers, and `Audio-Latency` could be read as a latency hint.
 fn reply(cseq: Option<&str>, server: Option<&str>) -> String {
-    let mut out = String::from("RTSP/1.0 200 OK\r\nContent-Length: 0\r\nAudio-Latency: 0\r\n");
+    let mut out = String::from("RTSP/1.0 200 OK\r\n");
     if let Some(server) = server {
         out.push_str(&format!("Server: {server}\r\n"));
     }
@@ -142,8 +146,8 @@ mod tests {
     #[test]
     fn reply_echoes_cseq() {
         assert_eq!(
-            reply(Some("2"), None),
-            "RTSP/1.0 200 OK\r\nContent-Length: 0\r\nAudio-Latency: 0\r\nCSeq: 2\r\n\r\n"
+            reply(Some("2"), Some("AirTunes/980.77.2")),
+            "RTSP/1.0 200 OK\r\nServer: AirTunes/980.77.2\r\nCSeq: 2\r\n\r\n"
         );
     }
 }

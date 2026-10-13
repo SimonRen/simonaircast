@@ -27,6 +27,8 @@ AirPlay 2 sender for Windows in Rust: capture system audio, stream to HomePods.
 - Sending threads need MMCSS "Pro Audio" priority and 1 ms timer resolution, or CPU load causes dropouts / bursty packets.
 - Loopback capture is post-Windows-volume; volume sync compensates by the endpoint's dB level (not the slider scalar).
 - Don't take over the HomePod (session/live/play) without asking — it interrupts whatever is playing at home.
+- Our `delay` (sync-packet shift) and the SETUP `latencyMin` may both add to the HomePod's real delay — nobody agrees how. Measure with `latency-test` (mic + clicks), don't reason it out.
+- When the sender falls behind (>60 ms), skip the missed packets (`RtpSender::skip`) instead of bursting them; retransmits older than the playout window are dropped.
 - The engine starts capture *before* connecting, so a missing audio device never grabs the speaker; `Session` cleans up in `Drop` (abort keepalive + best-effort TEARDOWN) — an early `?` once leaked a keepalive task per retry.
 
 ## Test environment

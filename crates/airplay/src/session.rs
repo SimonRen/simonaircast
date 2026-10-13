@@ -20,7 +20,8 @@ use crate::events::EventChannel;
 use crate::pairing::{self, SessionKeys};
 use crate::rtsp::{Connection, Protocol, Request};
 use crate::stream::{
-    self, FRAMES_PER_PACKET, PcmPacket, PcmSource, RtpSender, SAMPLE_RATE, SAMPLES_PER_PACKET,
+    self, Codec, FRAMES_PER_PACKET, PcmPacket, PcmSource, RtpSender, SAMPLE_RATE,
+    SAMPLES_PER_PACKET,
 };
 use crate::timing::{TimingServer, ntp_now};
 use crate::{Error, Result};
@@ -30,11 +31,37 @@ const FEEDBACK_INTERVAL: Duration = Duration::from_secs(2);
 const SYNC_INTERVAL: Duration = Duration::from_secs(1);
 /// Lag that starts to eat into the receiver's buffer meaningfully.
 pub const LATE_THRESHOLD: Duration = Duration::from_millis(100);
+/// Further behind than this, missed slots are skipped instead of sent in a
+/// burst: they would arrive too late to play, and a burst delays the packets
+/// that can still make it (AirFlash uses the same idea).
+pub const SKIP_THRESHOLD: Duration = Duration::from_millis(60);
 
-/// Realtime audio stream type and format (raw PCM 44.1 kHz/16-bit/stereo).
+/// Realtime audio stream type (44.1 kHz/16-bit/stereo, codec per [`Codec`]).
 const STREAM_TYPE_REALTIME: i64 = 96;
-const AUDIO_FORMAT_PCM_44100_16_2: i64 = 0x800;
-const COMPRESSION_PCM: i64 = 1;
+
+/// Session parameters beyond the receiver's address.
+#[derive(Debug, Clone, Copy)]
+pub struct SessionOptions {
+    pub ports: LocalPorts,
+    pub codec: Codec,
+    /// `latencyMin` / `latencyMax` announced in the stream SETUP, in frames at
+    /// 44.1 kHz. Senders disagree on whether HomePods honour these on top of
+    /// the sync-packet delay (docs/research/2026-10-13-open-source-senders.md);
+    /// they are configurable so the latency test can measure it.
+    pub latency_min: u32,
+    pub latency_max: u32,
+}
+
+impl Default for SessionOptions {
+    fn default() -> Self {
+        Self {
+            ports: LocalPorts::default(),
+            codec: Codec::Pcm,
+            latency_min: 11_025,
+            latency_max: 88_200,
+        }
+    }
+}
 
 /// Counters reported while and after playing.
 #[derive(Debug, Clone, Default)]
@@ -48,6 +75,10 @@ pub struct PlayStats {
     pub late_packets: u64,
     /// Worst lag between a packet's due time and when it was sent.
     pub max_lag: Duration,
+    /// Slots given up because the sender fell more than [`SKIP_THRESHOLD`] behind.
+    pub skipped_packets: u64,
+    /// Retransmit requests for packets already past their play time.
+    pub expired_retransmits: u64,
     pub elapsed: Duration,
 }
 
@@ -87,25 +118,34 @@ pub struct Session {
     feedback_task: JoinHandle<()>,
     feedback_failures: Arc<AtomicU32>,
     torn_down: AtomicBool,
+    options: SessionOptions,
     _keys: SessionKeys,
 }
 
-/// Consecutive failed keepalives (2 s apart) after which the receiver is
-/// considered gone.
-const MAX_FEEDBACK_FAILURES: u32 = 2;
+/// Consecutive failed keepalives (2 s apart, 2 s timeout each) after which
+/// the receiver is suspected gone…
+const SUSPECT_FEEDBACK_FAILURES: u32 = 2;
+/// …unless it is still asking us for the time within this window: then the
+/// RTSP connection is merely stalled (busy Wi-Fi) and we ride it out
+/// (idea from playfruit's two-signal liveness check).
+const TIMING_STILL_ALIVE: Duration = Duration::from_secs(5);
+/// Failures after which we give up regardless (~12 s, as AirFlash).
+const MAX_FEEDBACK_FAILURES: u32 = 6;
+const FEEDBACK_TIMEOUT: Duration = Duration::from_secs(2);
 
 impl Session {
     pub async fn connect(addr: SocketAddr, sender_name: &str) -> Result<Self> {
-        Self::connect_with_ports(addr, sender_name, LocalPorts::default()).await
+        Self::connect_with(addr, sender_name, SessionOptions::default()).await
     }
 
-    /// Like [`connect`](Self::connect), with preferred local UDP ports for the
-    /// traffic the receiver sends *to* us (so a firewall rule can name them).
-    pub async fn connect_with_ports(
+    /// Like [`connect`](Self::connect) with explicit options: preferred local
+    /// UDP ports (so a firewall rule can name them), codec and SETUP latency.
+    pub async fn connect_with(
         addr: SocketAddr,
         sender_name: &str,
-        ports: LocalPorts,
+        options: SessionOptions,
     ) -> Result<Self> {
+        let ports = options.ports;
         let mut conn = Connection::connect(addr).await?;
         let local_ip = conn.local_addr()?.ip();
         let keys = pairing::pair_transient(&mut conn).await?;
@@ -164,16 +204,16 @@ impl Session {
         let stream_setup = dict([(
             "streams",
             Value::Array(vec![dict([
-                ("audioFormat", int(AUDIO_FORMAT_PCM_44100_16_2)),
+                ("audioFormat", int(options.codec.audio_format())),
                 ("audioMode", "default".into()),
                 (
                     "controlPort",
                     int(control_socket.local_addr()?.port().into()),
                 ),
-                ("ct", int(COMPRESSION_PCM)),
+                ("ct", int(options.codec.compression_type())),
                 ("isMedia", true.into()),
-                ("latencyMax", int(88_200)),
-                ("latencyMin", int(11_025)),
+                ("latencyMax", int(options.latency_max.into())),
+                ("latencyMin", int(options.latency_min.into())),
                 ("shk", Value::Data(audio_key.to_vec())),
                 ("spf", int(FRAMES_PER_PACKET as i64)),
                 ("sr", int(SAMPLE_RATE.into())),
@@ -235,6 +275,7 @@ impl Session {
             feedback_task,
             feedback_failures,
             torn_down: AtomicBool::new(false),
+            options,
             _keys: keys,
         })
     }
@@ -244,7 +285,12 @@ impl Session {
         if self.events.closed_by_receiver() {
             return Err(Error::SessionEnded);
         }
-        if self.feedback_failures.load(Ordering::Relaxed) >= MAX_FEEDBACK_FAILURES {
+        let failures = self.feedback_failures.load(Ordering::Relaxed);
+        let timing_alive = self
+            .timing
+            .since_last_request()
+            .is_some_and(|age| age < TIMING_STILL_ALIVE);
+        if receiver_gone(failures, timing_alive) {
             return Err(Error::ReceiverUnreachable);
         }
         Ok(())
@@ -269,10 +315,18 @@ impl Session {
         let mut sender = RtpSender::new(
             Arc::new(data),
             &self.stream.audio_key,
+            self.options.codec,
             self.session_id,
             seq,
             latency_frames,
         );
+        // A resend is useless once the packet's play time has passed; the
+        // play time is at least the larger of our delay and latencyMin.
+        let resend_window = latency.max(Duration::from_secs_f64(
+            f64::from(self.options.latency_min) / f64::from(SAMPLE_RATE),
+        ));
+        let packet_duration =
+            Duration::from_secs_f64(FRAMES_PER_PACKET as f64 / f64::from(SAMPLE_RATE));
         let control = self.control_socket.clone();
         let receiver_control = SocketAddr::new(self.remote_ip, self.stream.control_port);
 
@@ -294,6 +348,9 @@ impl Session {
 
         loop {
             let due = start + Duration::from_secs_f64(sent_frames as f64 / f64::from(SAMPLE_RATE));
+            // Order matters: sync first (cheap, keeps the receiver's clock
+            // mapping fresh), then new audio, and only then retransmits — new
+            // media must never wait behind resends (AirFlash does the same).
             tokio::select! {
                 biased;
                 _ = sync.tick() => {
@@ -308,22 +365,28 @@ impl Session {
                     stats.elapsed = start.elapsed();
                     progress(&stats);
                 }
-                received = control.recv_from(&mut buf) => {
-                    // Windows surfaces ICMP errors as recv failures; ignore them.
-                    let Ok((n, from)) = received else { continue };
-                    if let Some((first, count)) = stream::parse_retransmit_request(&buf[..n]) {
-                        stats.retransmit_requests += 1;
-                        stats.packets_resent += sender.retransmit(&control, first, count, from).await as u64;
-                        tracing::debug!(first, count, "retransmit request");
-                    } else {
-                        tracing::debug!(len = n, kind = format!("{:#04x}", buf[1]), "unhandled control packet");
-                    }
-                }
                 _ = tokio::time::sleep_until(due) => {
                     let lag = Instant::now().saturating_duration_since(due);
                     stats.max_lag = stats.max_lag.max(lag);
                     if lag > LATE_THRESHOLD {
                         stats.late_packets += 1;
+                    }
+                    if lag > SKIP_THRESHOLD {
+                        // Fell far behind (e.g. the PC stalled): give up the slots
+                        // that would arrive too late, discarding their audio, and
+                        // re-sync right away so the receiver re-anchors.
+                        let missed = (lag.as_nanos() / packet_duration.as_nanos()) as u64;
+                        for _ in 0..missed {
+                            if !source_done && !source.fill(&mut pcm) {
+                                source_done = true;
+                            }
+                            sender.skip();
+                            sent_frames += FRAMES_PER_PACKET as u64;
+                        }
+                        stats.skipped_packets += missed;
+                        sync.reset_immediately();
+                        tracing::warn!(lag_ms = lag.as_millis() as u64, missed, "sender fell behind; skipped late slots");
+                        continue;
                     }
                     if !source_done && !source.fill(&mut pcm) {
                         source_done = true;
@@ -338,6 +401,19 @@ impl Session {
                     sender.send(&pcm).await?;
                     sent_frames += FRAMES_PER_PACKET as u64;
                     stats.packets_sent += 1;
+                }
+                received = control.recv_from(&mut buf) => {
+                    // Windows surfaces ICMP errors as recv failures; ignore them.
+                    let Ok((n, from)) = received else { continue };
+                    if let Some((first, count)) = stream::parse_retransmit_request(&buf[..n]) {
+                        stats.retransmit_requests += 1;
+                        let outcome = sender.retransmit(&control, first, count, from, resend_window).await;
+                        stats.packets_resent += outcome.resent as u64;
+                        stats.expired_retransmits += outcome.expired as u64;
+                        tracing::debug!(first, count, ?outcome, "retransmit request");
+                    } else {
+                        tracing::debug!(len = n, kind = format!("{:#04x}", buf[1]), "unhandled control packet");
+                    }
                 }
             }
         }
@@ -428,6 +504,15 @@ async fn connect_events(addr: SocketAddr, keys: &SessionKeys) -> Result<EventCha
     }
 }
 
+/// Liveness decision from the two signals: failed keepalives and whether the
+/// receiver still sends timing requests.
+fn receiver_gone(feedback_failures: u32, timing_alive: bool) -> bool {
+    if feedback_failures >= MAX_FEEDBACK_FAILURES {
+        return true;
+    }
+    feedback_failures >= SUSPECT_FEEDBACK_FAILURES && !timing_alive
+}
+
 /// Keepalive; counts consecutive failures so `play` can notice a dead receiver.
 fn spawn_feedback(conn: Arc<Mutex<Connection>>, failures: Arc<AtomicU32>) -> JoinHandle<()> {
     tokio::spawn(async move {
@@ -437,7 +522,9 @@ fn spawn_feedback(conn: Arc<Mutex<Connection>>, failures: Arc<AtomicU32>) -> Joi
             let result = conn
                 .lock()
                 .await
-                .request_ok(Request::new("POST", "/feedback", Protocol::Rtsp10))
+                .request_ok(
+                    Request::new("POST", "/feedback", Protocol::Rtsp10).timeout(FEEDBACK_TIMEOUT),
+                )
                 .await;
             match result {
                 Ok(_) => failures.store(0, Ordering::Relaxed),
@@ -557,6 +644,22 @@ mod tests {
         let back = Value::from_reader(std::io::Cursor::new(bytes)).unwrap();
         let stream = back.as_dictionary().unwrap()["streams"].as_array().unwrap()[0].clone();
         assert_eq!(get_int(&stream, "type"), Some(96));
+    }
+
+    #[test]
+    fn liveness_rides_out_rtsp_stalls_while_timing_continues() {
+        assert!(!receiver_gone(0, false));
+        assert!(!receiver_gone(1, false));
+        assert!(
+            receiver_gone(2, false),
+            "keepalives failing, no timing: gone"
+        );
+        assert!(
+            !receiver_gone(2, true),
+            "keepalives failing, timing alive: stall"
+        );
+        assert!(!receiver_gone(5, true));
+        assert!(receiver_gone(6, true), "hard limit regardless of timing");
     }
 
     #[test]

@@ -51,7 +51,7 @@ pub(crate) fn run(
     }
 }
 
-fn dev<E: std::fmt::Display>(context: &'static str) -> impl FnOnce(E) -> Error {
+pub(crate) fn dev<E: std::fmt::Display>(context: &'static str) -> impl FnOnce(E) -> Error {
     move |e| Error::Device(format!("{context}: {e}"))
 }
 
@@ -253,14 +253,14 @@ fn capture_loop(
 }
 
 /// Converts the device's interleaved samples to stereo f32.
-enum Decoder {
+pub(crate) enum Decoder {
     F32,
     I16,
     I32,
 }
 
 impl Decoder {
-    fn for_format(format: &WaveFormat) -> Result<Self> {
+    pub(crate) fn for_format(format: &WaveFormat) -> Result<Self> {
         let subformat = format
             .get_subformat()
             .map_err(|e| Error::Format(e.to_string()))?;
@@ -272,7 +272,7 @@ impl Decoder {
         }
     }
 
-    fn describe(&self) -> String {
+    pub(crate) fn describe(&self) -> String {
         match self {
             Self::F32 => "float32",
             Self::I16 => "int16",
@@ -292,7 +292,19 @@ impl Decoder {
         }
     }
 
-    fn width(&self) -> usize {
+    /// Writes one sample in the device format (the inverse of `sample`).
+    pub(crate) fn encode(&self, value: f32, out: &mut [u8]) {
+        let v = value.clamp(-1.0, 1.0);
+        match self {
+            Self::F32 => out[..4].copy_from_slice(&v.to_le_bytes()),
+            Self::I16 => out[..2].copy_from_slice(&((v * 32_767.0) as i16).to_le_bytes()),
+            Self::I32 => {
+                out[..4].copy_from_slice(&((f64::from(v) * 2_147_483_647.0) as i32).to_le_bytes());
+            }
+        }
+    }
+
+    pub(crate) fn width(&self) -> usize {
         match self {
             Self::I16 => 2,
             Self::F32 | Self::I32 => 4,
@@ -300,7 +312,7 @@ impl Decoder {
     }
 
     /// Takes the first two channels (front left/right); mono is duplicated.
-    fn to_stereo(&self, raw: &[u8], channels: usize, out: &mut [f32]) {
+    pub(crate) fn to_stereo(&self, raw: &[u8], channels: usize, out: &mut [f32]) {
         let w = self.width();
         let (out, _) = out.as_chunks_mut::<OUTPUT_CHANNELS>();
         for (frame, dst) in raw.chunks_exact(channels * w).zip(out) {

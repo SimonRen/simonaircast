@@ -69,6 +69,7 @@ simonaircast doctor                          # check settings, firewall, audio d
 simonaircast list                            # AirPlay receivers on the network
 simonaircast live --to 书房                  # stream PC audio until Ctrl+C (same engine as the tray)
 simonaircast live --to 书房 --delay-ms 150   # more margin if Wi-Fi is poor
+simonaircast latency-test --to 书房          # real delay via the PC mic (clicks); --sweep tries combinations
 simonaircast capture-check                   # is PC audio being captured?
 simonaircast play --to 书房 song.wav         # 16-bit 44.1 kHz WAV
 simonaircast play --to 书房 --beeps 600      # beep per second, sync test

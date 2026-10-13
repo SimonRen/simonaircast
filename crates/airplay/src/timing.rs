@@ -10,9 +10,9 @@
 //! Replies mirror pyatv's `TimingServer`.
 
 use std::net::IpAddr;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tokio::task::JoinHandle;
 
@@ -27,6 +27,8 @@ const NTP_UNIX_OFFSET: u64 = 0x83AA_7E80;
 pub struct TimingServer {
     port: u16,
     answered: Arc<AtomicU64>,
+    /// Clock-anchor nanoseconds of the last answered request (0 = none yet).
+    last_answer_ns: Arc<AtomicU64>,
     task: JoinHandle<()>,
 }
 
@@ -37,6 +39,8 @@ impl TimingServer {
         let port = socket.local_addr()?.port();
         let answered = Arc::new(AtomicU64::new(0));
         let counter = answered.clone();
+        let last_answer_ns = Arc::new(AtomicU64::new(0));
+        let last = last_answer_ns.clone();
 
         let task = tokio::spawn(async move {
             let mut buf = [0u8; 128];
@@ -54,6 +58,7 @@ impl TimingServer {
                     continue;
                 };
                 if socket.send_to(&resp, peer).await.is_ok() {
+                    last.store(anchor_elapsed().as_nanos() as u64, Ordering::Relaxed);
                     let total = counter.fetch_add(1, Ordering::Relaxed) + 1;
                     if total == 1 {
                         tracing::debug!(%peer, "answered first timing request");
@@ -65,8 +70,19 @@ impl TimingServer {
         Ok(Self {
             port,
             answered,
+            last_answer_ns,
             task,
         })
+    }
+
+    /// Time since the receiver last asked for the time. The receiver keeps
+    /// asking (~1/s) while it considers the session alive, so this is a second
+    /// liveness signal next to the `/feedback` keepalive.
+    pub fn since_last_request(&self) -> Option<Duration> {
+        match self.last_answer_ns.load(Ordering::Relaxed) {
+            0 => None,
+            ns => Some(anchor_elapsed().saturating_sub(Duration::from_nanos(ns))),
+        }
     }
 
     pub fn port(&self) -> u16 {
@@ -86,8 +102,37 @@ impl Drop for TimingServer {
     }
 }
 
-/// Current wall-clock time as a 64-bit NTP timestamp (32.32 fixed point).
+/// Wall-clock time sampled once, paired with a monotonic instant.
+struct ClockAnchor {
+    ntp: u64,
+    instant: Instant,
+}
+
+fn anchor() -> &'static ClockAnchor {
+    static ANCHOR: OnceLock<ClockAnchor> = OnceLock::new();
+    ANCHOR.get_or_init(|| ClockAnchor {
+        ntp: wall_clock_ntp(),
+        instant: Instant::now(),
+    })
+}
+
+fn anchor_elapsed() -> Duration {
+    anchor().instant.elapsed()
+}
+
+/// Current time as a 64-bit NTP timestamp (32.32 fixed point).
+///
+/// Monotonic: the wall clock is read once and then advanced with `Instant`.
+/// Timing replies and sync packets must share one steady time base; reading
+/// the wall clock each time let a Windows Time correction mid-stream jump the
+/// receiver's idea of "now" (OwnTone and AirFlash anchor the same way).
 pub fn ntp_now() -> u64 {
+    let a = anchor();
+    let elapsed = a.instant.elapsed();
+    a.ntp + (elapsed.as_secs() << 32) + ((u64::from(elapsed.subsec_nanos()) << 32) / 1_000_000_000)
+}
+
+fn wall_clock_ntp() -> u64 {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
@@ -145,5 +190,19 @@ mod tests {
     fn ntp_now_is_after_2026() {
         // 2026-01-01T00:00:00Z in NTP seconds.
         assert!(ntp_now() >> 32 > 1_767_225_600 + NTP_UNIX_OFFSET);
+    }
+
+    #[test]
+    fn ntp_now_is_monotonic_and_tracks_real_time() {
+        let a = ntp_now();
+        std::thread::sleep(Duration::from_millis(20));
+        let b = ntp_now();
+        assert!(b > a);
+        let elapsed_ms = ((b - a) * 1000) >> 32;
+        assert!((15..200).contains(&elapsed_ms), "elapsed {elapsed_ms} ms");
+        // Stays within a second of the wall clock (anchored, not drifting).
+        let wall = wall_clock_ntp();
+        let diff = wall.abs_diff(ntp_now()) >> 32;
+        assert!(diff < 1, "{diff} s off the wall clock");
     }
 }
