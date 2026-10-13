@@ -1,0 +1,29 @@
+# Rust build output
+/target
+
+# Installer output (tools/build-installer.ps1)
+/dist
+
+# Local test material: packet captures, logs, converted sample audio
+/captures
+*.etl
+*.pcap
+*.pcapng
+*.log
+
+# Raw icon dumps (icon.rs tests) — the committed artefact is assets/simonaircast.ico
+*.rgba
+
+# Python helpers in tools/ (run via `uv run --no-project`)
+.venv/
+__pycache__/
+*.py[cod]
+
+# Editors and OS
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
