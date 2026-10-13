@@ -57,7 +57,7 @@ Quit the tray app first (it would fight for the speaker). Needs a microphone on 
 speakers (the Dell monitor) so the gap to the HomePod can be measured.
 
 ```powershell
-$exe = "C:\work\simonaircast\target\release\simonaircast.exe"   # until the next installer
+$exe = "$env:ProgramFiles\simonaircast\simonaircast.exe"   # after installing 0.2.0
 & $exe latency-test --to 书房              # current defaults, 12 clicks
 & $exe latency-test --to 书房 --sweep      # 9 runs: latencyMin 250/100/50 × delay 100/50/0
 ```
