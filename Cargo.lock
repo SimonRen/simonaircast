@@ -29,7 +29,7 @@ dependencies = [
 
 [[package]]
 name = "airplay"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "chacha20poly1305",
  "getrandom",
@@ -126,7 +126,7 @@ dependencies = [
 
 [[package]]
 name = "audio-capture"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "rtrb",
  "rubato",
@@ -1594,7 +1594,7 @@ checksum = "3a219298ac11a56ea9a6d2120044824d6f01aeb034955e7af7bc16858527deea"
 
 [[package]]
 name = "simonaircast"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "airplay",
  "anyhow",
