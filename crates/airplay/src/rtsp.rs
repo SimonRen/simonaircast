@@ -19,6 +19,10 @@ use crate::{Error, Result};
 pub const USER_AGENT: &str = "AirPlay/550.10";
 
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
+/// A TCP handshake on the local network should complete quickly. Keeping this
+/// shorter than the RTSP response timeout makes a stale mDNS address fail fast
+/// so the engine can reconnect without waiting ten seconds per attempt.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Protocol {
@@ -112,7 +116,7 @@ pub struct Connection {
 
 impl Connection {
     pub async fn connect(addr: SocketAddr) -> Result<Self> {
-        let stream = timeout(RESPONSE_TIMEOUT, TcpStream::connect(addr))
+        let stream = timeout(CONNECT_TIMEOUT, TcpStream::connect(addr))
             .await
             .map_err(|_| Error::Timeout("TCP connect"))??;
         stream.set_nodelay(true)?;

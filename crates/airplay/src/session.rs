@@ -57,7 +57,7 @@ impl Default for SessionOptions {
         Self {
             ports: LocalPorts::default(),
             codec: Codec::Pcm,
-            latency_min: 11_025,
+            latency_min: stream::latency_frames(stream::DEFAULT_LATENCY),
             latency_max: 88_200,
         }
     }
@@ -404,7 +404,16 @@ impl Session {
                 }
                 received = control.recv_from(&mut buf) => {
                     // Windows surfaces ICMP errors as recv failures; ignore them.
-                    let Ok((n, from)) = received else { continue };
+                    let Ok((n, from)) = received else {
+                        // Avoid a hot loop if the OS keeps reporting a stale
+                        // ICMP error on the connected UDP socket.
+                        tokio::time::sleep(Duration::from_millis(2)).await;
+                        continue;
+                    };
+                    if n < 2 {
+                        tracing::debug!(len = n, "ignoring truncated control packet");
+                        continue;
+                    }
                     if let Some((first, count)) = stream::parse_retransmit_request(&buf[..n]) {
                         stats.retransmit_requests += 1;
                         let outcome = sender.retransmit(&control, first, count, from, resend_window).await;
@@ -496,12 +505,25 @@ async fn connect_events(addr: SocketAddr, keys: &SessionKeys) -> Result<EventCha
             Err(Error::Io(e))
                 if e.kind() == std::io::ErrorKind::ConnectionRefused && attempt < 5 =>
             {
+                let delay = event_retry_delay(attempt);
                 attempt += 1;
-                tokio::time::sleep(Duration::from_secs(1)).await;
+                tokio::time::sleep(delay).await;
+            }
+            Err(Error::Timeout("event TCP connect")) if attempt < 5 => {
+                let delay = event_retry_delay(attempt);
+                attempt += 1;
+                tokio::time::sleep(delay).await;
             }
             other => return other,
         }
     }
+}
+
+/// The event listener usually appears within a few hundred milliseconds after
+/// session SETUP. Retry quickly at first, then back off if the receiver is
+/// still busy, rather than adding up to five seconds to every connection.
+fn event_retry_delay(attempt: u32) -> Duration {
+    Duration::from_millis(50 * (1u64 << attempt.min(4)))
 }
 
 /// Liveness decision from the two signals: failed keepalives and whether the
@@ -660,6 +682,21 @@ mod tests {
         );
         assert!(!receiver_gone(5, true));
         assert!(receiver_gone(6, true), "hard limit regardless of timing");
+    }
+
+    #[test]
+    fn event_channel_retries_start_fast_and_back_off() {
+        let delays: Vec<_> = (0..5).map(event_retry_delay).collect();
+        assert_eq!(
+            delays,
+            [
+                Duration::from_millis(50),
+                Duration::from_millis(100),
+                Duration::from_millis(200),
+                Duration::from_millis(400),
+                Duration::from_millis(800),
+            ]
+        );
     }
 
     #[test]

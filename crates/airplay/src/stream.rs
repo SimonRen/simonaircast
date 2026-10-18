@@ -22,16 +22,20 @@ pub const FRAMES_PER_PACKET: usize = 352;
 pub const CHANNELS: usize = 2;
 pub const SAMPLES_PER_PACKET: usize = FRAMES_PER_PACKET * CHANNELS;
 pub const SAMPLE_RATE: u32 = 44_100;
-/// Default gap between a packet being sent and played: 250 ms, the
+/// Default gap between a packet being sent and played: 100 ms, the
 /// `latencyMin` we announce in SETUP. pyatv uses 1.5 s, which is fine for files
 /// but puts live PC audio audibly behind.
-pub const DEFAULT_LATENCY: std::time::Duration = std::time::Duration::from_millis(250);
+pub const DEFAULT_LATENCY: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// Converts a latency to RTP frames at 44.1 kHz.
 pub fn latency_frames(latency: std::time::Duration) -> u32 {
     (latency.as_secs_f64() * f64::from(SAMPLE_RATE)).round() as u32
 }
 const BACKLOG_PACKETS: usize = 1000;
+/// A receiver normally requests only a handful of packets. Cap one control
+/// datagram so a malformed or stale request cannot monopolize the audio loop
+/// with a large retransmit burst.
+const MAX_RETRANSMIT_BATCH: u16 = 64;
 
 /// One packet of interleaved 16-bit stereo PCM at 44.1 kHz.
 pub type PcmPacket = [i16; SAMPLES_PER_PACKET];
@@ -250,7 +254,8 @@ impl RtpSender {
         max_age: Duration,
     ) -> RetransmitOutcome {
         let mut outcome = RetransmitOutcome::default();
-        for i in 0..count {
+        let handled = count.min(MAX_RETRANSMIT_BATCH);
+        for i in 0..handled {
             let seq = first.wrapping_add(i);
             let Some(sent) = self.backlog.get(seq) else {
                 outcome.missing += 1;
@@ -268,6 +273,7 @@ impl RtpSender {
                 outcome.resent += 1;
             }
         }
+        outcome.missing += usize::from(count - handled);
         outcome
     }
 }
@@ -341,13 +347,21 @@ mod tests {
     const LATENCY_FRAMES: u32 = 11_025;
 
     #[test]
-    fn default_latency_is_250_ms_in_frames() {
-        assert_eq!(latency_frames(DEFAULT_LATENCY), LATENCY_FRAMES);
+    fn default_latency_is_100_ms_in_frames() {
+        assert_eq!(latency_frames(DEFAULT_LATENCY), 4_410);
     }
 
     async fn sender() -> RtpSender {
+        // Keep a local UDP peer bound so macOS does not surface an ICMP
+        // port-unreachable error from the test destination on the next send.
+        let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = peer.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 2048];
+            while peer.recv_from(&mut buf).await.is_ok() {}
+        });
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        socket.connect("127.0.0.1:9").await.unwrap();
+        socket.connect(peer_addr).await.unwrap();
         RtpSender::new(
             Arc::new(socket),
             &[7; 32],
@@ -476,6 +490,24 @@ mod tests {
             .retransmit(&control, 0xFFFF, 1, to, Duration::from_millis(1))
             .await;
         assert_eq!(stale.expired, 1);
+    }
+
+    #[tokio::test]
+    async fn retransmit_batch_is_capped_to_keep_audio_pacing_responsive() {
+        let control = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let to = receiver.local_addr().unwrap();
+        let mut s = sender().await;
+        let pcm = [0i16; SAMPLES_PER_PACKET];
+        for _ in 0..100 {
+            s.send(&pcm).await.unwrap();
+        }
+
+        let outcome = s
+            .retransmit(&control, 0xFFFF, 100, to, Duration::from_secs(5))
+            .await;
+        assert_eq!(outcome.resent, MAX_RETRANSMIT_BATCH as usize);
+        assert_eq!(outcome.missing, 36);
     }
 
     #[test]

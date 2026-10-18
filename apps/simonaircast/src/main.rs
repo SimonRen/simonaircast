@@ -133,7 +133,7 @@ enum Command {
 struct Advanced {
     /// `latencyMin` asked of the receiver in SETUP, in ms. Receivers may add
     /// buffering of their own up to this; lower can cut real delay.
-    #[arg(long, default_value_t = 250)]
+    #[arg(long, default_value_t = 100)]
     latency_min_ms: u64,
     /// Send uncompressed ALAC frames instead of raw PCM (for receivers that
     /// refuse PCM).

@@ -7,8 +7,10 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
+#[cfg(windows)]
 use std::time::Duration;
 
+#[cfg(windows)]
 const POLL_INTERVAL: Duration = Duration::from_millis(150);
 
 #[derive(Debug, Clone, PartialEq)]

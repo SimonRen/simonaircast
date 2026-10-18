@@ -45,7 +45,10 @@ impl Default for Settings {
             buffer: Duration::from_millis(25),
             volume_sync: true,
             codec: Codec::Pcm,
-            latency_min: Duration::from_millis(250),
+            // HomePod reports about 88 ms of internal render latency. A
+            // 100 ms floor leaves a small Wi-Fi margin without adding the
+            // 250 ms of buffering used by file-oriented senders.
+            latency_min: Duration::from_millis(100),
         }
     }
 }
@@ -173,6 +176,16 @@ async fn run(
             continue;
         }
 
+        // A stale cached mDNS address is common after a router DHCP renewal.
+        // Clear it only for connection-level failures; media/session failures
+        // should keep the fast reconnect path.
+        if matches!(
+            error.downcast_ref::<airplay::Error>(),
+            Some(airplay::Error::Io(_) | airplay::Error::Timeout(_))
+        ) {
+            crate::net::invalidate(&name);
+        }
+
         if started.elapsed() >= HEALTHY_RUN {
             failures = 0;
         }
@@ -256,10 +269,16 @@ async fn stream(
     // Desktop) we fail without ever taking the speaker away from whoever is
     // using it. Audio that piles up while connecting is trimmed to the target
     // fill on the first read.
-    let mut capture = Capture::start(CaptureConfig {
+    let capture_config = CaptureConfig {
         target_fill: settings.buffer,
-    })
-    .context("starting system audio capture")?;
+    };
+    // WASAPI setup waits synchronously for the capture thread to publish its
+    // device format. Keep that wait off the Tokio workers so reconnects and
+    // timing replies remain responsive under device churn.
+    let mut capture = tokio::task::spawn_blocking(move || Capture::start(capture_config))
+        .await
+        .context("capture setup task")?
+        .context("starting system audio capture")?;
 
     let connect = async {
         let addr = crate::net::resolve(name).await?;
@@ -375,6 +394,14 @@ mod tests {
     fn backoff_grows_then_caps() {
         let waits: Vec<u64> = (1..=6).map(|n| backoff(n).as_secs()).collect();
         assert_eq!(waits, [1, 2, 5, 10, 10, 10]);
+    }
+
+    #[test]
+    fn default_stream_settings_use_the_low_latency_receiver_floor() {
+        let settings = Settings::default();
+        assert_eq!(settings.delay, Duration::from_millis(100));
+        assert_eq!(settings.latency_min, Duration::from_millis(100));
+        assert_eq!(settings.buffer, Duration::from_millis(25));
     }
 
     #[test]

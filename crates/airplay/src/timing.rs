@@ -50,6 +50,9 @@ impl TimingServer {
                     // Windows reports ICMP port-unreachable as a recv error; keep serving.
                     Err(e) => {
                         tracing::debug!(error = %e, "timing socket recv error");
+                        // A persistent socket error must not turn this
+                        // background task into a busy loop.
+                        tokio::time::sleep(Duration::from_millis(10)).await;
                         continue;
                     }
                 };

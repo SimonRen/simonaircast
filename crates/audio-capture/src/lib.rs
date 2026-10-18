@@ -12,6 +12,63 @@
 pub mod priority;
 #[cfg(windows)]
 pub mod probe;
+#[cfg(not(windows))]
+pub mod probe {
+    //! Compile-time compatible latency probe API for non-Windows builds.
+    //!
+    //! The real probe uses WASAPI and is only available on Windows. Keeping
+    //! the same public types here lets the cross-platform CLI build and report
+    //! a useful runtime error instead of failing during compilation.
+
+    use std::time::Duration;
+
+    use crate::{Error, Result};
+
+    #[derive(Debug, Clone)]
+    pub struct ProbeConfig {
+        pub clicks: usize,
+        pub period: Duration,
+        pub level: f32,
+        pub record: bool,
+    }
+
+    impl Default for ProbeConfig {
+        fn default() -> Self {
+            Self {
+                clicks: 12,
+                period: Duration::from_millis(1500),
+                level: 0.7,
+                record: true,
+            }
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    pub struct ProbeRecording {
+        pub mic_name: Option<String>,
+        pub output_name: String,
+        pub rate: u32,
+        pub samples: Vec<f32>,
+        pub clicks: Vec<f64>,
+    }
+
+    pub fn record_clicks(_config: &ProbeConfig) -> Result<ProbeRecording> {
+        Err(Error::Unsupported)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn reports_unsupported_instead_of_missing_api() {
+            assert!(matches!(
+                record_clicks(&ProbeConfig::default()),
+                Err(Error::Unsupported)
+            ));
+        }
+    }
+}
 pub mod volume;
 #[cfg(windows)]
 mod wasapi_loopback;
@@ -224,12 +281,14 @@ impl Drop for Capture {
 /// ζ ≈ 0.09 and swung between the clamps on real hardware.)
 ///
 /// Corrections stay far below audibility: the ±1000 ppm clamp is ≈ 1.7 cents.
+#[cfg(any(windows, test))]
 struct DriftController {
     target: f64,
     smoothed: Option<f64>,
     integral: f64,
 }
 
+#[cfg(any(windows, test))]
 impl DriftController {
     const G: f64 = OUTPUT_RATE as f64 * 1e-6;
     const OMEGA: f64 = 0.03;
@@ -248,6 +307,7 @@ impl DriftController {
         }
     }
 
+    #[cfg(windows)]
     fn reset(&mut self) {
         self.smoothed = None;
         self.integral = 0.0;

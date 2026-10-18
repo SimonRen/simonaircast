@@ -13,11 +13,14 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::task::JoinHandle;
+use tokio::time::timeout;
 
 use crate::Result;
 use crate::crypto::HapFraming;
 use crate::pairing::SessionKeys;
 use crate::rtsp::parse_message;
+
+const EVENT_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 
 pub struct EventChannel {
     received: Arc<AtomicU64>,
@@ -27,7 +30,9 @@ pub struct EventChannel {
 
 impl EventChannel {
     pub async fn connect(addr: SocketAddr, keys: &SessionKeys) -> Result<Self> {
-        let mut stream = TcpStream::connect(addr).await?;
+        let mut stream = timeout(EVENT_CONNECT_TIMEOUT, TcpStream::connect(addr))
+            .await
+            .map_err(|_| crate::Error::Timeout("event TCP connect"))??;
         stream.set_nodelay(true)?;
         let (events_write, events_read) = keys.event_keys();
         // Swapped on purpose: the receiver is the client of this channel.
