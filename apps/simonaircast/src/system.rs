@@ -34,6 +34,15 @@ const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 #[cfg(windows)]
 const RUN_VALUE: &str = "simonaircast";
 
+#[cfg(windows)]
+fn netsh_path() -> std::path::PathBuf {
+    std::env::var_os("WINDIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from(r"C:\Windows"))
+        .join("System32")
+        .join("netsh.exe")
+}
+
 /// Whether we're registered to start at login.
 pub fn autostart_enabled() -> bool {
     #[cfg(windows)]
@@ -195,7 +204,7 @@ fn netsh(args: &[&str]) -> i32 {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
-        std::process::Command::new("netsh")
+        std::process::Command::new(netsh_path())
             .args(args)
             .creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW)
             .stdout(std::process::Stdio::null())
@@ -313,5 +322,19 @@ impl Drop for SingleInstance {
         unsafe {
             windows_sys::Win32::Foundation::CloseHandle(self.0);
         }
+    }
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::netsh_path;
+
+    #[test]
+    fn netsh_is_resolved_from_the_windows_system_directory() {
+        assert!(
+            netsh_path()
+                .to_string_lossy()
+                .ends_with(r"System32\netsh.exe")
+        );
     }
 }

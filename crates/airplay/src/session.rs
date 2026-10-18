@@ -192,10 +192,13 @@ impl Session {
             .request_ok(Request::new("SETUP", &uri, Protocol::Rtsp10).body(BPLIST, bplist(&setup)?))
             .await?
             .plist()?;
-        let event_port = get_int(&resp, "eventPort")
-            .ok_or_else(|| Error::Protocol("session SETUP reply has no eventPort".into()))?;
+        let event_port = checked_port(
+            get_int(&resp, "eventPort")
+                .ok_or_else(|| Error::Protocol("session SETUP reply has no eventPort".into()))?,
+            "eventPort",
+        )?;
 
-        let events = connect_events(SocketAddr::new(addr.ip(), event_port as u16), &keys).await?;
+        let events = connect_events(SocketAddr::new(addr.ip(), event_port), &keys).await?;
 
         let control_socket = Arc::new(crate::bind_udp(local_ip, ports.control).await?);
         let control_task = spawn_control_drain(control_socket.clone());
@@ -243,10 +246,17 @@ impl Session {
             .and_then(|d| d.get("streams")?.as_array()?.first().cloned())
             .ok_or_else(|| Error::Protocol("stream SETUP reply has no streams".into()))?;
         let stream = StreamInfo {
-            data_port: get_int(&stream, "dataPort")
-                .ok_or_else(|| Error::Protocol("stream SETUP reply has no dataPort".into()))?
-                as u16,
-            control_port: get_int(&stream, "controlPort").unwrap_or(0) as u16,
+            data_port: checked_port(
+                get_int(&stream, "dataPort")
+                    .ok_or_else(|| Error::Protocol("stream SETUP reply has no dataPort".into()))?,
+                "dataPort",
+            )?,
+            control_port: checked_port(
+                get_int(&stream, "controlPort").ok_or_else(|| {
+                    Error::Protocol("stream SETUP reply has no controlPort".into())
+                })?,
+                "controlPort",
+            )?,
             latency_ms: get_int(&stream, "arrivalToRenderLatencyMs"),
             audio_key,
         };
@@ -412,6 +422,10 @@ impl Session {
                     };
                     if n < 2 {
                         tracing::debug!(len = n, "ignoring truncated control packet");
+                        continue;
+                    }
+                    if !is_receiver_control_peer(receiver_control, from) {
+                        tracing::debug!(%from, "ignoring control packet from an unexpected peer");
                         continue;
                     }
                     if let Some((first, count)) = stream::parse_retransmit_request(&buf[..n]) {
@@ -612,6 +626,17 @@ fn get_int(v: &Value, key: &str) -> Option<i64> {
     v.as_dictionary()?.get(key)?.as_signed_integer()
 }
 
+fn checked_port(value: i64, field: &str) -> Result<u16> {
+    u16::try_from(value)
+        .ok()
+        .filter(|port| *port != 0)
+        .ok_or_else(|| Error::Protocol(format!("receiver returned invalid {field} {value}")))
+}
+
+fn is_receiver_control_peer(expected: SocketAddr, actual: SocketAddr) -> bool {
+    expected == actual
+}
+
 fn bplist(v: &Value) -> Result<Vec<u8>> {
     let mut out = Vec::new();
     v.to_writer_binary(&mut out)?;
@@ -682,6 +707,28 @@ mod tests {
         );
         assert!(!receiver_gone(5, true));
         assert!(receiver_gone(6, true), "hard limit regardless of timing");
+    }
+
+    #[test]
+    fn validates_receiver_ports_before_connecting() {
+        assert_eq!(checked_port(7000, "eventPort").unwrap(), 7000);
+        assert!(checked_port(0, "eventPort").is_err());
+        assert!(checked_port(-1, "eventPort").is_err());
+        assert!(checked_port(65_536, "eventPort").is_err());
+    }
+
+    #[test]
+    fn retransmit_requests_are_only_accepted_from_the_receiver_control_port() {
+        let receiver = "192.0.2.10:60000".parse().unwrap();
+        assert!(is_receiver_control_peer(receiver, receiver));
+        assert!(!is_receiver_control_peer(
+            receiver,
+            "192.0.2.10:60001".parse().unwrap()
+        ));
+        assert!(!is_receiver_control_peer(
+            receiver,
+            "192.0.2.11:60000".parse().unwrap()
+        ));
     }
 
     #[test]

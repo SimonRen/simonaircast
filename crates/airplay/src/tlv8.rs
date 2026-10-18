@@ -17,6 +17,8 @@ pub mod tag {
     pub const FLAGS: u8 = 0x13;
 }
 
+const MAX_TLV_BYTES: usize = 64 * 1024;
+
 pub fn encode(items: &[(u8, &[u8])]) -> Vec<u8> {
     let mut out = Vec::new();
     for &(tag, value) in items {
@@ -35,6 +37,9 @@ pub fn encode(items: &[(u8, &[u8])]) -> Vec<u8> {
 
 /// Decodes into tag -> value, concatenating split values.
 pub fn decode(mut data: &[u8]) -> Result<BTreeMap<u8, Vec<u8>>> {
+    if data.len() > MAX_TLV_BYTES {
+        return Err(Error::Protocol("TLV8 message too large".into()));
+    }
     let mut items: BTreeMap<u8, Vec<u8>> = BTreeMap::new();
     while !data.is_empty() {
         let [tag, len, rest @ ..] = data else {
@@ -82,5 +87,15 @@ mod tests {
     fn rejects_truncated_input() {
         assert!(decode(&[0x06, 0x02, 0x01]).is_err());
         assert!(decode(&[0x06]).is_err());
+    }
+
+    #[test]
+    fn rejects_unreasonably_large_pairing_messages() {
+        let mut data = vec![0x03, 255];
+        data.extend(std::iter::repeat_n(0xAB, 255));
+        data.extend(std::iter::repeat_n(data.clone(), 300).flatten());
+        assert!(
+            matches!(decode(&data), Err(Error::Protocol(message)) if message.contains("too large"))
+        );
     }
 }

@@ -23,6 +23,11 @@ const RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
 /// shorter than the RTSP response timeout makes a stale mDNS address fail fast
 /// so the engine can reconnect without waiting ten seconds per attempt.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+/// AirPlay control and event messages are small plist/parameter messages. A
+/// bound keeps a peer that never completes a message from growing the inbox
+/// without limit.
+const MAX_HEADER_BYTES: usize = 64 * 1024;
+const MAX_BODY_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Protocol {
@@ -252,8 +257,14 @@ impl Message {
 /// number of bytes used; `None` if more bytes are needed.
 pub(crate) fn parse_message(data: &[u8]) -> Result<Option<(Message, usize)>> {
     let Some(head_end) = data.windows(4).position(|w| w == b"\r\n\r\n") else {
+        if data.len() > MAX_HEADER_BYTES {
+            return Err(Error::Protocol("message headers too large".into()));
+        }
         return Ok(None);
     };
+    if head_end > MAX_HEADER_BYTES {
+        return Err(Error::Protocol("message headers too large".into()));
+    }
     let head = std::str::from_utf8(&data[..head_end])
         .map_err(|_| Error::Protocol("message head is not UTF-8".into()))?;
     let mut lines = head.split("\r\n");
@@ -273,13 +284,19 @@ pub(crate) fn parse_message(data: &[u8]) -> Result<Option<(Message, usize)>> {
         .transpose()
         .map_err(|_| Error::Protocol("bad Content-Length".into()))?
         .unwrap_or(0);
+    if len > MAX_BODY_BYTES {
+        return Err(Error::Protocol("message body too large".into()));
+    }
 
     let body_start = head_end + 4;
-    if data.len() < body_start + len {
+    let body_end = body_start
+        .checked_add(len)
+        .ok_or_else(|| Error::Protocol("message body length overflow".into()))?;
+    if data.len() < body_end {
         return Ok(None);
     }
-    let body = data[body_start..body_start + len].to_vec();
-    Ok(Some((Message { body, ..msg }, body_start + len)))
+    let body = data[body_start..body_end].to_vec();
+    Ok(Some((Message { body, ..msg }, body_end)))
 }
 
 fn parse_response(data: &[u8]) -> Result<Option<(Response, usize)>> {
@@ -345,5 +362,28 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(resp.status, 403);
+    }
+
+    #[test]
+    fn rejects_headers_larger_than_the_protocol_limit() {
+        let mut raw = b"RTSP/1.0 200 OK\r\nX-Long: ".to_vec();
+        raw.extend(std::iter::repeat_n(b'x', 70 * 1024));
+        raw.extend_from_slice(b"\r\n\r\n");
+        assert!(matches!(
+            parse_response(&raw),
+            Err(Error::Protocol(message)) if message.contains("headers too large")
+        ));
+    }
+
+    #[test]
+    fn rejects_bodies_larger_than_the_protocol_limit() {
+        let raw = format!(
+            "RTSP/1.0 200 OK\r\nContent-Length: {}\r\n\r\n",
+            2 * 1024 * 1024
+        );
+        assert!(matches!(
+            parse_response(raw.as_bytes()),
+            Err(Error::Protocol(message)) if message.contains("body too large")
+        ));
     }
 }

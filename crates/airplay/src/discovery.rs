@@ -43,7 +43,7 @@ pub struct Device {
 
 impl Device {
     pub fn has_feature(&self, bit: u32) -> bool {
-        self.features & (1 << bit) != 0
+        bit < u64::BITS && self.features & (1u64 << bit) != 0
     }
 }
 
@@ -133,5 +133,21 @@ mod tests {
     #[test]
     fn strips_service_suffix() {
         assert_eq!(instance_name("书房._airplay._tcp.local."), "书房");
+    }
+
+    #[test]
+    fn unknown_feature_bits_are_safe() {
+        let device = Device {
+            name: "test".into(),
+            id: String::new(),
+            model: String::new(),
+            os_version: String::new(),
+            host: String::new(),
+            port: 7000,
+            addresses: Vec::new(),
+            features: u64::MAX,
+            public_key: None,
+        };
+        assert!(!device.has_feature(64));
     }
 }

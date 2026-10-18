@@ -68,6 +68,11 @@ impl SrpClient {
 
     pub fn process(&self, password: &str, salt: &[u8], server_public: &[u8]) -> Result<SrpSession> {
         let n = &self.n;
+        if server_public.len() > N_LEN {
+            return Err(Error::Pairing(
+                "server sent an oversized SRP public key".into(),
+            ));
+        }
         let b_pub = BigUint::from_bytes_be(server_public);
         if (&b_pub % n).is_zero() {
             return Err(Error::Pairing(
@@ -170,5 +175,11 @@ mod tests {
     fn rejects_zero_server_key() {
         let client = SrpClient::new(&[7; 32]);
         assert!(client.process("3939", &[1; 16], &[0]).is_err());
+    }
+
+    #[test]
+    fn rejects_server_keys_larger_than_the_srp_group() {
+        let client = SrpClient::new(&[7; 32]);
+        assert!(client.process("3939", &[1; 16], &[1; N_LEN + 1]).is_err());
     }
 }

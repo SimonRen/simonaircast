@@ -74,6 +74,7 @@ pub struct HapFraming {
 
 const FRAME_LEN: usize = 1024;
 const TAG_LEN: usize = 16;
+const MAX_PENDING_BYTES: usize = 4 * 1024 * 1024;
 
 impl HapFraming {
     pub fn new(write_key: &[u8; 32], read_key: &[u8; 32]) -> Self {
@@ -97,6 +98,9 @@ impl HapFraming {
 
     /// Feeds received bytes; returns whatever plaintext complete frames yield.
     pub fn open(&mut self, data: &[u8]) -> Result<Vec<u8>> {
+        if data.len() > MAX_PENDING_BYTES.saturating_sub(self.pending.len()) {
+            return Err(Error::Protocol("encrypted frame buffer too large".into()));
+        }
         self.pending.extend_from_slice(data);
         let mut plain = Vec::new();
         let mut consumed = 0;
@@ -175,5 +179,14 @@ mod tests {
         wire[5] ^= 1;
         let mut peer = HapFraming::new(&key(READ_KEY), &key(WRITE_KEY));
         assert!(matches!(peer.open(&wire), Err(Error::Decrypt)));
+    }
+
+    #[test]
+    fn rejects_an_unbounded_partial_frame() {
+        let mut peer = HapFraming::new(&[7; 32], &[8; 32]);
+        let data = vec![0u8; 4 * 1024 * 1024 + 1];
+        assert!(
+            matches!(peer.open(&data), Err(Error::Protocol(message)) if message.contains("buffer"))
+        );
     }
 }
